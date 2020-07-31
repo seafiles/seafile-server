@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"html"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/haiwen/seafile-server/fileserver/blockmgr"
 	"github.com/haiwen/seafile-server/fileserver/commitmgr"
+	"github.com/haiwen/seafile-server/fileserver/fsmgr"
 	"github.com/haiwen/seafile-server/fileserver/repomgr"
 	"github.com/haiwen/seafile-server/fileserver/share"
 )
@@ -23,6 +25,7 @@ import (
 const (
 	seafileServerChannelEvent = "seaf_server.event"
 	seafileServerChannelStats = "seaf_server.stats"
+	emptySHA1                 = "0000000000000000000000000000000000000000"
 	tokenExpireTime           = 7200
 	permExpireTime            = 7200
 	virtualRepoExpireTime     = 7200
@@ -157,6 +160,54 @@ func permissionCheckCB(rsp http.ResponseWriter, r *http.Request) *appError {
 			}
 		}
 	}
+	return nil
+}
+
+func getFsObjIDCB(rsp http.ResponseWriter, r *http.Request) *appError {
+	queries := r.URL.Query()
+
+	serverHead := queries.Get("server-head")
+	if !isObjectIDValid(serverHead) {
+		msg := "Invalid server-head parameter."
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	clientHead := queries.Get("client-head")
+	if !isObjectIDValid(clientHead) {
+		msg := "Invalid client-head parameter."
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	dirOnlyArg := queries.Get("dir-only")
+	var dirOnly bool
+	if dirOnlyArg != "" {
+		dirOnly = true
+	}
+
+	vars := mux.Vars(r)
+	repoID := vars["repoid"]
+	if _, err := validateToken(r, repoID, false); err != nil {
+		return err
+	}
+	repo := repomgr.Get(repoID)
+	if repo == nil {
+		err := fmt.Errorf("Failed to find repo %.8s", repoID)
+		return &appError{err, "", http.StatusInternalServerError}
+	}
+	ret, err := calculateSendObjectList(repo, serverHead, clientHead, dirOnly)
+	if err != nil {
+		return &appError{err, "", http.StatusInternalServerError}
+	}
+
+	objList, err := json.Marshal(ret)
+	if err != nil {
+		return &appError{err, "", http.StatusInternalServerError}
+	}
+
+	rsp.Header().Set("Content-Length", strconv.Itoa(len(objList)))
+	rsp.WriteHeader(http.StatusOK)
+	rsp.Write(objList)
+
 	return nil
 }
 
@@ -521,4 +572,214 @@ func removeExpireCache() {
 	tokenCache.Range(deleteTokens)
 	permCache.Range(deletePerms)
 	virtualRepoInfoCache.Range(deleteVirtualRepoInfo)
+}
+
+func calculateSendObjectList(repo *repomgr.Repo, serverHead string, clientHead string, dirOnly bool) ([]string, error) {
+	masterHead, err := commitmgr.Load(repo.ID, serverHead)
+	if err != nil {
+		log.Printf("Server head commit %s:%s not found", repo.ID, serverHead)
+		return nil, err
+	}
+	var remoteHead *commitmgr.Commit
+	remoteHeadRoot := emptySHA1
+	if clientHead != "" {
+		remoteHead, err = commitmgr.Load(repo.ID, clientHead)
+		if err != nil {
+			log.Printf("Remote head commit %s:%s not found", repo.ID, serverHead)
+			return nil, err
+		}
+		remoteHeadRoot = remoteHead.RootID
+	}
+
+	var results []string
+	if remoteHeadRoot != masterHead.RootID && masterHead.RootID != emptySHA1 {
+		results = append(results, masterHead.RootID)
+	}
+
+	trees := []string{masterHead.RootID, remoteHeadRoot}
+	results = append(diffTrees(2, trees, repo.ID, dirOnly), results...)
+
+	return results, nil
+}
+
+func diffTrees(n int, roots []string, repoID string, dirOnly bool) []string {
+	if n != 2 && n != 3 {
+		return nil
+	}
+	trees := make([]*fsmgr.SeafDir, n)
+	for i := 0; i < n; i++ {
+		root, err := fsmgr.GetSeafdir(repoID, roots[i])
+		if err != nil {
+			log.Printf("Failed to find dir %s:%s", repoID, roots[i])
+			return nil
+		}
+		trees[i] = root
+	}
+
+	return diffTreesRecursive(n, trees, "", repoID, dirOnly)
+}
+
+func diffTreesRecursive(n int, trees []*fsmgr.SeafDir, baseDir string, repoID string, dirOnly bool) []string {
+	var results []string
+
+	ptrs := make([][]fsmgr.SeafDirent, 3)
+	dents := make([]*fsmgr.SeafDirent, 3)
+
+	for i := 0; i < n; i++ {
+		if trees[i] != nil {
+			ptrs[i] = trees[i].Entries
+		} else {
+			ptrs[i] = nil
+		}
+	}
+
+	for {
+		firstName := ""
+		done := true
+		for i := 0; i < n; i++ {
+			if len(ptrs[i]) > 0 {
+				done = false
+				dent := ptrs[i][0]
+
+				if firstName == "" {
+					firstName = dent.Name
+				} else if strings.Compare(firstName, dent.Name) > 0 {
+					firstName = dent.Name
+				}
+			}
+
+		}
+		if done {
+			break
+		}
+
+		for i := 0; i < n; i++ {
+			if len(ptrs[i]) > 0 {
+				dent := ptrs[i][0]
+				if firstName == dent.Name {
+					dents[i] = &dent
+					ptrs[i] = ptrs[i][1:]
+				}
+
+			}
+		}
+
+		if n == 2 && dents[0] != nil && dents[1] != nil &&
+			direntSame(dents[0], dents[1]) {
+			continue
+		}
+		if n == 3 && dents[0] != nil && dents[1] != nil &&
+			dents[2] != nil && direntSame(dents[0], dents[1]) &&
+			direntSame(dents[0], dents[2]) {
+			continue
+		}
+
+		results = append(diffFiles(n, dents, dirOnly), results...)
+		results = append(diffDirectories(n, dents, baseDir, repoID, dirOnly), results...)
+	}
+
+	return results
+}
+
+func diffFiles(n int, dents []*fsmgr.SeafDirent, dirOnly bool) []string {
+	if dirOnly {
+		return nil
+	}
+
+	var nFiles int
+	files := make([]*fsmgr.SeafDirent, 3)
+	for i := 0; i < n; i++ {
+		if dents[i] != nil && fsmgr.IsRegular(dents[i].Mode) {
+			files[i] = dents[i]
+			nFiles++
+		}
+	}
+
+	if nFiles == 0 {
+		return nil
+	}
+
+	return collectFileIDs(files)
+}
+
+func diffDirectories(n int, dents []*fsmgr.SeafDirent, baseDir string, repoID string, dirOnly bool) []string {
+	var results []string
+	dirs := make([]*fsmgr.SeafDirent, 3)
+	subDirs := make([]*fsmgr.SeafDir, 3)
+	var nDirs int
+	for i := 0; i < n; i++ {
+		if dents[i] != nil && fsmgr.IsDir(dents[i].Mode) {
+			dirs[i] = dents[i]
+			nDirs++
+		}
+	}
+	if nDirs == 0 {
+		return nil
+	}
+
+	results = append(collectDirIDs(dirs), results...)
+
+	var dirName string
+	for i := 0; i < n; i++ {
+		if dents[i] != nil && fsmgr.IsDir(dents[i].Mode) {
+			dir, err := fsmgr.GetSeafdir(repoID, dents[i].ID)
+			if err != nil {
+				log.Printf("Failed to find dir %s:%s", repoID, dents[i].ID)
+				return nil
+			}
+			subDirs[i] = dir
+			dirName = dents[i].Name
+		}
+	}
+
+	newBaseDir := baseDir + "/" + dirName
+	results = append(diffTreesRecursive(n, subDirs, newBaseDir, repoID, dirOnly), results...)
+
+	return results
+}
+
+func collectFileIDs(files []*fsmgr.SeafDirent) []string {
+	file1 := files[0]
+	file2 := files[1]
+
+	var pret []string
+	if file1 != nil &&
+		(file2 == nil || file1.ID != file2.ID) &&
+		file1.ID != emptySHA1 {
+		pret = append(pret, file1.ID)
+	}
+	return pret
+}
+
+func collectDirIDs(dirs []*fsmgr.SeafDirent) []string {
+	dir1 := dirs[0]
+	dir2 := dirs[1]
+
+	var pret []string
+	if dir1 != nil &&
+		(dir2 == nil || dir1.ID != dir2.ID) &&
+		dir1.ID != emptySHA1 {
+		pret = append(pret, dir1.ID)
+	}
+	return pret
+}
+
+func direntSame(dentA, dentB *fsmgr.SeafDirent) bool {
+	return dentA.ID == dentB.ID &&
+		dentA.Mode == dentB.Mode &&
+		dentA.Mtime == dentA.Mtime
+}
+
+func isObjectIDValid(objID string) bool {
+	if len(objID) != 40 {
+		return false
+	}
+	for i := 0; i < len(objID); i++ {
+		c := objID[i]
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') {
+			continue
+		}
+		return false
+	}
+	return true
 }
